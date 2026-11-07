@@ -1,9 +1,11 @@
 using DatabaseSchemaReader.DataSchema;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Windows.Forms;
 
 namespace DatabaseSchemaViewer
 {
@@ -14,9 +16,8 @@ namespace DatabaseSchemaViewer
 
         private readonly DatabaseSchema _databaseSchema;
         private bool _splitTables;
-        private bool _writingTableFile;
         private IDictionary<string, string> _tableFiles;
-
+        private bool _writingTableFile;
         public DocRunner(DatabaseSchema databaseSchema)
         {
             _databaseSchema = databaseSchema ?? throw new ArgumentNullException(nameof(databaseSchema));
@@ -38,6 +39,212 @@ namespace DatabaseSchemaViewer
             var outputFile = Path.Combine(directory.FullName, "database-schema.md");
             File.WriteAllText(outputFile, BuildMarkdown(), Encoding.UTF8);
             return outputFile;
+        }
+
+        private static void AppendArgument(StringBuilder sb, DatabaseArgument argument)
+        {
+            sb.Append(argument.DatabaseDataType);
+            if (argument.DataType != null)
+            {
+                if (argument.DataType.IsString)
+                {
+                    sb.Append("(");
+                    var length = argument.Length.GetValueOrDefault();
+                    sb.Append(length != -1 ? length.ToString(CultureInfo.InvariantCulture) : "MAX");
+                    sb.Append(")");
+                }
+                else if (argument.DataType.IsNumeric && !argument.DataType.IsInt)
+                {
+                    sb.Append("(");
+                    sb.Append(argument.Precision);
+                    if (argument.Scale > 0)
+                    {
+                        sb.Append(",");
+                        sb.Append(argument.Scale);
+                    }
+                    sb.Append(")");
+                }
+            }
+            sb.Append(" ");
+            sb.Append($"{argument.ArgumentMode.ToString()} ");
+            sb.AppendLine();
+        }
+
+        private static void AppendIndexes(StringBuilder sb, DatabaseTable table)
+        {
+            sb.AppendLine("### Indexes");
+
+            var indexes = table.Indexes;
+            if (indexes == null || indexes.Count == 0)
+            {
+                sb.AppendLine("- None");
+                sb.AppendLine();
+                return;
+            }
+
+            foreach (var index in indexes.OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                var indexName = Safe(index.Name);
+                var columns = index.Columns;
+                var isUnique = index.IsUnique;
+
+                sb.Append("- ");
+                sb.Append("**");
+                sb.Append(indexName);
+                sb.Append("**");
+
+                if (isUnique)
+                {
+                    sb.Append(" (Unique)");
+                }
+
+                if (columns.Count > 0)
+                {
+                    sb.Append(": ");
+                    sb.Append(string.Join(", ", columns.Select(x => Safe(x.Name))));
+                }
+
+                sb.AppendLine();
+            }
+
+            sb.AppendLine();
+        }
+
+        private static void AppendMarkdownAnchor(StringBuilder sb, string headingText, string fileName = null)
+        {
+            if (string.IsNullOrWhiteSpace(headingText))
+            {
+                return;
+            }
+
+            sb.Append("[`");
+            sb.Append(headingText);
+            sb.Append("`](");
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                sb.Append(fileName);
+            }
+            sb.Append("#");
+            sb.Append(headingText.ToLowerInvariant().Replace(" ", "-"));
+            sb.Append(")");
+        }
+
+        private static IDictionary<string, string> BuildTableFileMap(ICollection<DatabaseTable> tables)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (tables == null || tables.Count == 0)
+            {
+                return map;
+            }
+
+            var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var table in tables.OrderBy(t => t.SchemaOwner).ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                var key = GetTableKey(table);
+                var fileName = MakeUniqueFileName(MakeSafeFileName(key) + ".md", usedFileNames);
+                var relativePath = TablesFolderName + "/" + fileName;
+
+                map[key] = relativePath;
+                if (!map.ContainsKey(table.Name))
+                {
+                    map[table.Name] = relativePath;
+                }
+            }
+
+            return map;
+        }
+
+        private static string EscapePipe(string value)
+        {
+            return Safe(value).Replace("|", "\\|");
+        }
+
+        private static string FormatConstraintColumns(DatabaseConstraint constraint)
+        {
+            if (constraint == null || constraint.Columns == null)
+            {
+                return string.Empty;
+            }
+
+            var columns = constraint.Columns
+                .Where(c => !string.IsNullOrWhiteSpace(c))
+                .Select(c => Safe(c))
+                .ToArray();
+
+            if (columns.Length == 0)
+            {
+                return string.Empty;
+            }
+
+            return string.Join(", ", columns);
+        }
+
+        private static string GetTableKey(DatabaseTable table)
+        {
+            var schema = Safe(table?.SchemaOwner);
+            var name = Safe(table?.Name);
+            return string.IsNullOrWhiteSpace(schema) ? name : schema + "." + name;
+        }
+
+        private static string GetTypeDisplay(DatabaseColumn column)
+        {
+            if (column == null) return string.Empty;
+
+            var type = Safe(column.DataTypeDefinition());
+
+            return type;
+        }
+
+        private static string MakeSafeFileName(string value)
+        {
+            var safe = Safe(value);
+            var invalidChars = Path.GetInvalidFileNameChars();
+            var chars = safe.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray();
+            var fileName = new string(chars).Trim();
+            fileName = fileName.Replace(" ", "-"); //space in markdown is a dash
+            return string.IsNullOrWhiteSpace(fileName) ? "table" : fileName;
+        }
+
+        private static string MakeUniqueFileName(string fileName, ISet<string> usedFileNames)
+        {
+            if (usedFileNames.Add(fileName))
+            {
+                return fileName;
+            }
+
+            var baseName = Path.GetFileNameWithoutExtension(fileName);
+            var extension = Path.GetExtension(fileName);
+            var i = 2;
+            string candidate;
+            do
+            {
+                candidate = baseName + "-" + i + extension;
+                i++;
+            }
+            while (!usedFileNames.Add(candidate));
+
+            return candidate;
+        }
+
+        private static string Safe(string value)
+        {
+            return value ?? string.Empty;
+        }
+
+        private void AddReferences(StringBuilder sb, DatabaseTable table)
+        {
+            var refs = table.ForeignKeyChildren;
+            if (refs == null || refs.Count == 0)
+            {
+                return;
+            }
+            sb.AppendLine("### References");
+            foreach (var refTable in refs)
+            {
+                sb.Append("- ");
+                AppendMarkdownAnchor(sb, refTable.Name, ResolveTableFileName(refTable.Name));
+                sb.AppendLine();
+            }
         }
 
         private void AppendConstraints(StringBuilder sb, DatabaseTable table)
@@ -113,64 +320,98 @@ namespace DatabaseSchemaViewer
 
             sb.AppendLine();
         }
-
-        private static void AppendIndexes(StringBuilder sb, DatabaseTable table)
+        private void AppendFunctions(StringBuilder sb, IList<DatabaseFunction> functions)
         {
-            sb.AppendLine("### Indexes");
-
-            var indexes = table.Indexes;
-            if (indexes == null || indexes.Count == 0)
+            if (functions == null || functions.Count == 0)
             {
-                sb.AppendLine("- None");
-                sb.AppendLine();
                 return;
             }
-
-            foreach (var index in indexes.OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase))
+            sb.AppendLine("# Functions");
+            foreach (var function in functions.OrderBy(f => f.SchemaOwner)
+                         .ThenBy(f => f.Name, StringComparer.OrdinalIgnoreCase))
             {
-                var indexName = Safe(index.Name);
-                var columns = index.Columns;
-                var isUnique = index.IsUnique;
-
-                sb.Append("- ");
-                sb.Append("**");
-                sb.Append(indexName);
-                sb.Append("**");
-
-                if (isUnique)
+                sb.AppendLine($"- [`{function.Name}`]");
+                foreach (var argument in function.Arguments.OrderBy(a => a.Ordinal))
                 {
-                    sb.Append(" (Unique)");
-                }
+                    var argumentName = argument.Name;
+                    if (string.IsNullOrWhiteSpace(argumentName))
+                    {
+                        argumentName = "?";
+                    }
 
-                if (columns.Count > 0)
-                {
-                    sb.Append(": ");
-                    sb.Append(string.Join(", ", columns.Select(x => Safe(x.Name))));
+                    sb.Append($"  - [`{argumentName}`] ");
+                    AppendArgument(sb, argument);
                 }
-
-                sb.AppendLine();
             }
-
-            sb.AppendLine();
         }
 
-        private static void AppendMarkdownAnchor(StringBuilder sb, string headingText, string fileName = null)
+        private void AppendPackages(StringBuilder sb, IList<DatabasePackage> packages)
         {
-            if (string.IsNullOrWhiteSpace(headingText))
+            if (packages == null || packages.Count == 0)
             {
                 return;
             }
 
-            sb.Append("[`");
-            sb.Append(headingText);
-            sb.Append("`](");
-            if (!string.IsNullOrWhiteSpace(fileName))
+            sb.AppendLine("# Packages");
+            foreach (var package in packages.OrderBy(p => p.SchemaOwner)
+                         .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
             {
-                sb.Append(fileName);
+                sb.AppendLine($"- [`{package.Name}`]");
+                foreach (var procedure in package.StoredProcedures)
+                {
+                    sb.AppendLine($"  - [`{procedure.Name}`]");
+                    foreach (var argument in procedure.Arguments.OrderBy(a => a.Ordinal))
+                    {
+                        var argumentName = argument.Name;
+                        if (string.IsNullOrWhiteSpace(argumentName))
+                        {
+                            argumentName = "?";
+                        }
+
+                        sb.Append($"    - [`{argumentName}`] ");
+                        AppendArgument(sb, argument);
+                    }
+                }
+                foreach (var function in package.Functions)
+                {
+                    sb.AppendLine($"  - [`{function.Name}`]");
+                    foreach (var argument in function.Arguments.OrderBy(a => a.Ordinal))
+                    {
+                        var argumentName = argument.Name;
+                        if (string.IsNullOrWhiteSpace(argumentName))
+                        {
+                            argumentName = "?";
+                        }
+
+                        sb.Append($"    - [`{argumentName}`] ");
+                        AppendArgument(sb, argument);
+                    }
+                }
             }
-            sb.Append("#");
-            sb.Append(headingText.ToLowerInvariant().Replace(" ", "-"));
-            sb.Append(")");
+        }
+
+        private void AppendProcedures(StringBuilder sb, IList<DatabaseStoredProcedure> procedures)
+        {
+            if (procedures == null || procedures.Count == 0)
+            {
+                return;
+            }
+
+            sb.AppendLine("# Procedures");
+            foreach (var procedure in procedures.OrderBy(p => p.SchemaOwner).ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                sb.AppendLine($"- [`{procedure.Name}`]");
+                foreach (var argument in procedure.Arguments.OrderBy(a => a.Ordinal))
+                {
+                    var argumentName = argument.Name;
+                    if (string.IsNullOrWhiteSpace(argumentName))
+                    {
+                        argumentName = "?";
+                    }
+                    sb.Append($"  - [`{argumentName}`] ");
+                    AppendArgument(sb, argument);
+                }
+            }
         }
 
         private void AppendTable(StringBuilder sb, DatabaseTable table)
@@ -222,23 +463,6 @@ namespace DatabaseSchemaViewer
             AddReferences(sb, table);
             //to do: triggers
         }
-
-        private void AddReferences(StringBuilder sb, DatabaseTable table)
-        {
-            var refs = table.ForeignKeyChildren;
-            if (refs == null || refs.Count == 0)
-            {
-                return;
-            }
-            sb.AppendLine("### References");
-            foreach (var refTable in refs)
-            {
-                sb.Append("- ");
-                AppendMarkdownAnchor(sb, refTable.Name, ResolveTableFileName(refTable.Name));
-                sb.AppendLine();
-            }
-        }
-
         private void AppendTables(StringBuilder sb, ICollection<DatabaseTable> tables)
         {
             if (tables == null || tables.Count == 0)
@@ -264,165 +488,6 @@ namespace DatabaseSchemaViewer
             {
                 AppendTable(sb, table);
             }
-        }
-
-        private string ResolveTableFileName(string tableName)
-        {
-            if (_tableFiles == null || string.IsNullOrWhiteSpace(tableName))
-            {
-                return null;
-            }
-
-            if (!_tableFiles.TryGetValue(tableName, out var fileName) || string.IsNullOrWhiteSpace(fileName))
-            {
-                return null;
-            }
-
-            if (_writingTableFile)
-            {
-                var prefix = TablesFolderName + "/";
-                if (fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    return fileName.Substring(prefix.Length);
-                }
-            }
-
-            return fileName;
-        }
-
-        private static string GetTableKey(DatabaseTable table)
-        {
-            var schema = Safe(table?.SchemaOwner);
-            var name = Safe(table?.Name);
-            return string.IsNullOrWhiteSpace(schema) ? name : schema + "." + name;
-        }
-
-        private static IDictionary<string, string> BuildTableFileMap(ICollection<DatabaseTable> tables)
-        {
-            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            if (tables == null || tables.Count == 0)
-            {
-                return map;
-            }
-
-            var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var table in tables.OrderBy(t => t.SchemaOwner).ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase))
-            {
-                var key = GetTableKey(table);
-                var fileName = MakeUniqueFileName(MakeSafeFileName(key) + ".md", usedFileNames);
-                var relativePath = TablesFolderName + "/" + fileName;
-
-                map[key] = relativePath;
-                if (!map.ContainsKey(table.Name))
-                {
-                    map[table.Name] = relativePath;
-                }
-            }
-
-            return map;
-        }
-
-        private static string MakeUniqueFileName(string fileName, ISet<string> usedFileNames)
-        {
-            if (usedFileNames.Add(fileName))
-            {
-                return fileName;
-            }
-
-            var baseName = Path.GetFileNameWithoutExtension(fileName);
-            var extension = Path.GetExtension(fileName);
-            var i = 2;
-            string candidate;
-            do
-            {
-                candidate = baseName + "-" + i + extension;
-                i++;
-            }
-            while (!usedFileNames.Add(candidate));
-
-            return candidate;
-        }
-
-        private static string MakeSafeFileName(string value)
-        {
-            var safe = Safe(value);
-            var invalidChars = Path.GetInvalidFileNameChars();
-            var chars = safe.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray();
-            var fileName = new string(chars).Trim();
-            fileName = fileName.Replace(" ", "-"); //space in markdown is a dash
-            return string.IsNullOrWhiteSpace(fileName) ? "table" : fileName;
-        }
-
-        private void WriteTables(DirectoryInfo directory, ICollection<DatabaseTable> tables)
-        {
-            if (tables == null || tables.Count == 0 || _tableFiles == null)
-            {
-                return;
-            }
-
-            var tablesDirectoryPath = Path.Combine(directory.FullName, TablesFolderName);
-            Directory.CreateDirectory(tablesDirectoryPath);
-
-            _writingTableFile = true;
-            try
-            {
-                foreach (var table in tables.OrderBy(t => t.SchemaOwner).ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase))
-                {
-                    var key = GetTableKey(table);
-                    if (!_tableFiles.TryGetValue(key, out var relativePath) || string.IsNullOrWhiteSpace(relativePath))
-                    {
-                        continue;
-                    }
-
-                    var tableFilePath = Path.Combine(directory.FullName, relativePath.Replace('/', Path.DirectorySeparatorChar));
-                    var sb = new StringBuilder();
-                    AppendTable(sb, table);
-                    File.WriteAllText(tableFilePath, sb.ToString(), Encoding.UTF8);
-                }
-            }
-            finally
-            {
-                _writingTableFile = false;
-            }
-        }
-
-        private static string EscapePipe(string value)
-        {
-            return Safe(value).Replace("|", "\\|");
-        }
-
-        private static string FormatConstraintColumns(DatabaseConstraint constraint)
-        {
-            if (constraint == null || constraint.Columns == null)
-            {
-                return string.Empty;
-            }
-
-            var columns = constraint.Columns
-                .Where(c => !string.IsNullOrWhiteSpace(c))
-                .Select(c => Safe(c))
-                .ToArray();
-
-            if (columns.Length == 0)
-            {
-                return string.Empty;
-            }
-
-            return string.Join(", ", columns);
-        }
-
-        private static string GetTypeDisplay(DatabaseColumn column)
-        {
-            if (column == null) return string.Empty;
-
-            var type = Safe(column.DataTypeDefinition());
-
-            return type;
-        }
-
-        private static string Safe(string value)
-        {
-            return value ?? string.Empty;
         }
 
         private void AppendView(StringBuilder sb, DatabaseView view)
@@ -454,7 +519,6 @@ namespace DatabaseSchemaViewer
         {
             if (views == null || views.Count == 0)
             {
-                sb.AppendLine("No views found.");
                 return;
             }
 
@@ -480,9 +544,69 @@ namespace DatabaseSchemaViewer
 
             AppendViews(sb, _databaseSchema.Views);
 
-            //to do: procedures, functions, packages, sequences?
+            AppendProcedures(sb, _databaseSchema.StoredProcedures);
+            AppendFunctions(sb, _databaseSchema.Functions);
+            AppendPackages(sb, _databaseSchema.Packages);
+
+            //to do: sequences?
 
             return sb.ToString();
+        }
+
+        private string ResolveTableFileName(string tableName)
+        {
+            if (_tableFiles == null || string.IsNullOrWhiteSpace(tableName))
+            {
+                return null;
+            }
+
+            if (!_tableFiles.TryGetValue(tableName, out var fileName) || string.IsNullOrWhiteSpace(fileName))
+            {
+                return null;
+            }
+
+            if (_writingTableFile)
+            {
+                var prefix = TablesFolderName + "/";
+                if (fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return fileName.Substring(prefix.Length);
+                }
+            }
+
+            return fileName;
+        }
+        private void WriteTables(DirectoryInfo directory, ICollection<DatabaseTable> tables)
+        {
+            if (tables == null || tables.Count == 0 || _tableFiles == null)
+            {
+                return;
+            }
+
+            var tablesDirectoryPath = Path.Combine(directory.FullName, TablesFolderName);
+            Directory.CreateDirectory(tablesDirectoryPath);
+
+            _writingTableFile = true;
+            try
+            {
+                foreach (var table in tables.OrderBy(t => t.SchemaOwner).ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase))
+                {
+                    var key = GetTableKey(table);
+                    if (!_tableFiles.TryGetValue(key, out var relativePath) || string.IsNullOrWhiteSpace(relativePath))
+                    {
+                        continue;
+                    }
+
+                    var tableFilePath = Path.Combine(directory.FullName, relativePath.Replace('/', Path.DirectorySeparatorChar));
+                    var sb = new StringBuilder();
+                    AppendTable(sb, table);
+                    File.WriteAllText(tableFilePath, sb.ToString(), Encoding.UTF8);
+                }
+            }
+            finally
+            {
+                _writingTableFile = false;
+            }
         }
     }
 }
